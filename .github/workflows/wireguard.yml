@@ -1,0 +1,70 @@
+name: WireGuard VPN via GitHub Actions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y wireguard qrencode curl jq
+
+      - name: Generate WireGuard keys
+        run: |
+          umask 077
+          wg genkey | tee server_private | wg pubkey > server_public
+          wg genkey | tee client_private | wg pubkey > client_public
+
+      - name: Create WireGuard config files
+        run: |
+          SERVER_PRIV=$(cat server_private)
+          CLIENT_PUB=$(cat client_public)
+          echo "[Interface]
+          Address = 10.0.0.1/24
+          ListenPort = 51820
+          PrivateKey = $SERVER_PRIV
+
+          [Peer]
+          PublicKey = $CLIENT_PUB
+          AllowedIPs = 10.0.0.2/32" > wg0.conf
+
+      - name: Start WireGuard server
+        run: |
+          sudo wg-quick up ./wg0.conf
+
+      - name: Setup Ngrok
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update && sudo apt install -y ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTHTOKEN }}
+
+      - name: Start Ngrok UDP tunnel
+        run: |
+          nohup ngrok tcp 51820 &
+          sleep 10
+          curl http://127.0.0.1:4040/api/tunnels > tunnels.json
+          cat tunnels.json
+
+      - name: Generate client config
+        run: |
+          SERVER_PUB=$(cat server_public)
+          CLIENT_PRIV=$(cat client_private)
+          ENDPOINT=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url' | sed 's/tcp:\/\///')
+          echo "[Interface]
+          PrivateKey = $CLIENT_PRIV
+          Address = 10.0.0.2/24
+          DNS = 1.1.1.1
+
+          [Peer]
+          PublicKey = $SERVER_PUB
+          Endpoint = $ENDPOINT
+          AllowedIPs = 0.0.0.0/0
+          PersistentKeepalive = 25" > client.conf
+          cat client.conf
+
+      - name: Show QR for mobile import
+        run: qrencode -t ANSIUTF8 < client.conf
